@@ -41,9 +41,9 @@ class IncrementalPCAonGPU():
         # Initialize attributes to avoid errors during the first call to partial_fit
         self.mean_ = None  # Will be initialized properly in partial_fit based on data dimensions
         self.var_ = None  # Will be initialized properly in partial_fit based on data dimensions
-        self.n_samples_seen_ = 0
+        self.n_samples_seen_ = 0.
 
-    def _validate_data(self, X, dtype=torch.float32, copy=True):
+    def _validate_data(self, X, X_weights=None, dtype=torch.float32, copy=True):
         """
         Validates and converts the input data `X` to the appropriate tensor format.
 
@@ -52,6 +52,7 @@ class IncrementalPCAonGPU():
 
         Args:
             X (Union[np.ndarray, torch.Tensor]): Input data which can be a numpy array or a PyTorch tensor.
+            X_weights (Union[np.ndarray, torch.Tensor]): Weights broadcastable to X, which can be a numpy array or a PyTorch tensor.
             dtype (torch.dtype, optional): Desired data type for the tensor. Defaults to torch.float32.
             copy (bool, optional): Whether to clone the tensor. If True, a new tensor is returned; otherwise, the original tensor 
                                    (or its device-transferred version) is returned. Defaults to True.
@@ -65,15 +66,37 @@ class IncrementalPCAonGPU():
             X = X.to(self.device)
         if copy:
             X = X.clone()
-        return X
+
+        if X_weights is not None :
+            # Make sure the weights are reals, even if X is complex
+            dtype_real = {
+                    torch.complex32:torch.float16,
+                    torch.complex64:torch.float32,
+                    torch.complex128:torch.float64
+                }.get(X.dtype, X.dtype)
+
+            if not isinstance(X_weights, torch.Tensor):
+                X_weights = torch.tensor(X_weights, dtype=dtype_real).to(self.device)
+
+            # Check that X_weights is broadcastable with X up to its feature (last) dim
+            if X.shape[0] != 1 and X_weights.shape[0] != 1 and X.shape[0] != X_weights.shape[0] :
+                raise ValueError(f"X_weights is not broadcastable to X. {X.shape}, {X_weights.shape}")
+                
+            if X_weights.device == torch.device("cpu"):
+                X_weights = X_weights.to(self.device)
+            if copy:
+                X_weights = X_weights.clone()
+            
+        return X, X_weights
 
     @staticmethod
-    def _incremental_mean_and_var(X, last_mean, last_variance, last_sample_count):
+    def _incremental_mean_and_var(X, X_weights, last_mean, last_variance, last_sample_count):
         """
         Computes the incremental mean and variance for the data `X`.
 
         Args:
             X (torch.Tensor): The batch input data tensor with shape (n_samples, n_features).
+            X_weights (torch.Tensor): Weights broadcastable to X, with shape (n_samples).
             last_mean (torch.Tensor): The previous mean tensor with shape (n_features,).
             last_variance (torch.Tensor): The previous variance tensor with shape (n_features,).
             last_sample_count (torch.Tensor): The count tensor of samples processed before the current batch.
@@ -90,9 +113,16 @@ class IncrementalPCAonGPU():
         if last_variance is None:
             last_variance = torch.zeros(X.shape[1], device=X.device)
 
-        new_sample_count = X.shape[0]
-        new_mean = torch.mean(X, dim=0)
-        new_sum_square = torch.sum((X - new_mean) ** 2, dim=0)
+        if X_weights is None :
+            new_sample_count = X.shape[0]
+            new_mean = torch.mean(X, dim=0)
+            new_sum_square = torch.sum((X - new_mean) ** 2, dim=0)
+        else :
+            eps = torch.tensor(torch.finfo(X.dtype).eps, device=X.device)
+
+            new_sample_count = torch.sum(X_weights)
+            new_mean = torch.sum(X_weights[...,None] * X, dim=0) / torch.max(new_sample_count, eps)
+            new_sum_square = torch.sum(X_weights[...,None] * ((X - new_mean) ** 2), dim=0) / torch.maximum(new_sample_count, eps)
         
         updated_sample_count = last_sample_count + new_sample_count
         
@@ -126,18 +156,21 @@ class IncrementalPCAonGPU():
         v *= signs[:, None]
         return u, v
     
-    def fit(self, X, check_input=True):
+    def fit(self, X, X_weights=None, check_input=True, dtype=torch.float32):
         """
         Fits the model with data `X` using minibatches of size `batch_size`.
 
         Args:
             X (torch.Tensor): The input data tensor with shape (n_samples, n_features).
+            X_weights (torch.Tensor): Weights broadcastable to X, with shape (n_samples).
+            check_input (bool, optional): If True, validates the input. Defaults to True.
+            dtype (torch.dtype): if check_input, X, and X_weights will be cast to this dtype. If dtype is complex, X_weights will be cast to the corresponding real dtype.
 
         Returns:
             IncrementalPCAGPU: The fitted IPCA model.
         """
         if check_input:
-            X = self._validate_data(X)
+            X, X_weights = self._validate_data(X, X_weights, dtype=dtype)
         n_samples, n_features = X.shape
         if self.batch_size is None:
             self.batch_size_ = 5 * n_features
@@ -147,17 +180,23 @@ class IncrementalPCAonGPU():
         for start in range(0, n_samples, self.batch_size_):
             end = min(start + self.batch_size_, n_samples)
             X_batch = X[start:end]
-            self.partial_fit(X_batch, check_input=False)
+            if X_weights is not None :
+                X_batch_weights = X_weights[start:end]
+            else :
+                X_batch_weights = None
+            self.partial_fit(X_batch, X_batch_weights, check_input=False)
 
         return self
 
-    def partial_fit(self, X, check_input=True):
+    def partial_fit(self, X, X_weights=None, check_input=True, dtype=torch.float32):
         """
         Incrementally fits the model with batch data `X`.
 
         Args:
             X (torch.Tensor): The batch input data tensor with shape (n_samples, n_features).
+            X_weights (torch.Tensor): Weights broadcastable to X, with shape (n_samples).
             check_input (bool, optional): If True, validates the input. Defaults to True.
+            dtype (torch.dtype): if check_input, X, and X_weights will be cast to this dtype. If dtype is complex, X_weights will be cast to the corresponding real dtype.
 
         Returns:
             IncrementalPCAGPU: The updated IPCA model after processing the batch.
@@ -165,27 +204,47 @@ class IncrementalPCAonGPU():
         first_pass = not hasattr(self, "components_")
 
         if check_input:
-            X = self._validate_data(X)
-        n_samples, n_features = X.shape
+            X, X_weights = self._validate_data(X, X_weights, dtype=dtype)
+
+        if X_weights is None :
+            n_samples = X.shape[0]
+        else :
+            n_samples = torch.sum(X_weights).item()
+        n_features = X.shape[1]
 
         if first_pass:
             self.components_ = None
         if self.n_components is None:
-            self.n_components_ = min(n_samples, n_features)
+            self.n_components_ = min(X.shape[0], n_features)
 
-        col_mean, col_var, n_total_samples = self._incremental_mean_and_var(
-            X, self.mean_, self.var_, torch.tensor([self.n_samples_seen_], device=X.device)
+        col_mean, col_var, n_total_samples_tensor = self._incremental_mean_and_var(
+            X, X_weights, self.mean_, self.var_, torch.tensor([self.n_samples_seen_], device=X.device)
         )
+        # Rather than evaluating .item() repeated times, evaluate it once here
+        n_total_samples = n_total_samples_tensor.item()
+
+        # Need eps to check n_samples and the like since self.n_samples_seen_ is now float to accomodate X_weights
+        eps = torch.finfo(X.dtype).eps
 
         # Whitening
-        if self.n_samples_seen_ == 0:
+        if self.n_samples_seen_ < eps:
             X -= col_mean
         else:
-            col_batch_mean = torch.mean(X, dim=0)
-            X -= col_batch_mean
-            mean_correction_factor = torch.sqrt(
-                torch.tensor((self.n_samples_seen_ / n_total_samples.item()) * n_samples, device=X.device)
-            )
+
+            if X_weights is None :
+                col_batch_mean = torch.mean(X, dim=0)
+                X -= col_batch_mean
+                mean_correction_factor = torch.sqrt(
+                    torch.tensor((self.n_samples_seen_ / n_total_samples) * n_samples, device=X.device)
+                )
+
+            else :
+                col_batch_mean = torch.sum(X_weights[...,None] * X, dim=0) / max(n_samples, eps)
+                X = (X - col_batch_mean) * X_weights[...,None]
+                mean_correction_factor = torch.sqrt(
+                    torch.tensor((self.n_samples_seen_ / n_total_samples) * n_samples, device=X.device)
+                )
+
             mean_correction = mean_correction_factor * (self.mean_ - col_batch_mean)
 
             if self.singular_values_ is not None and self.components_ is not None:
@@ -197,25 +256,27 @@ class IncrementalPCAonGPU():
                     )
                 )
 
+            
+
         U, S, Vt = torch.linalg.svd(X, full_matrices=False)
         U, Vt = self._svd_flip(U, Vt, u_based_decision=False)
-        explained_variance = S**2 / (n_total_samples.item() - 1)
-        explained_variance_ratio = S**2 / torch.sum(col_var * n_total_samples.item())
+        explained_variance = S**2 / (n_total_samples - 1)
+        explained_variance_ratio = S**2 / torch.sum(col_var * n_total_samples)
 
-        self.n_samples_seen_ = n_total_samples.item()
+        self.n_samples_seen_ = n_total_samples
         self.components_ = Vt[: self.n_components_]
         self.singular_values_ = S[: self.n_components_]
         self.mean_ = col_mean
         self.var_ = col_var
         self.explained_variance_ = explained_variance[: self.n_components_]
         self.explained_variance_ratio_ = explained_variance_ratio[: self.n_components_]
-        if self.n_components_ not in (n_samples, n_features):
+        if self.n_components_ != n_features and (abs(self.n_components - n_samples) > eps):
             self.noise_variance_ = explained_variance[self.n_components_ :].mean().item()
         else:
             self.noise_variance_ = 0.0
         return self
 
-    def transform(self, X, check_input=True):
+    def transform(self, X, check_input=True, dtype=torch.float32):
         """
         Applies dimensionality reduction to `X`.
 
@@ -223,19 +284,21 @@ class IncrementalPCAonGPU():
 
         Args:
             X (torch.Tensor): New data tensor with shape (n_samples, n_features) to be transformed.
+            check_input (bool, optional): If True, validates the input. Defaults to True.
+            dtype (torch.dtype): if check_input, X, and X_weights will be cast to this dtype. If dtype is complex, X_weights will be cast to the corresponding real dtype.
 
         Returns:
             torch.Tensor: Transformed data tensor with shape (n_samples, n_components).
         """
         if check_input:
-            X = self._validate_data(X)
+            X, _ = self._validate_data(X, dtype=dtype)
         if self.mean_ is None or self.components_ is None:
             raise ValueError("Model must be fitted before transforming data. Please call 'fit' method first or call 'fit_transform' method instead.")
         X = X.to(self.mean_.device)
         X -= self.mean_
         return torch.mm(X, self.components_.T)
     
-    def fit_transform(self, X, check_input=True):
+    def fit_transform(self, X, X_weights, check_input=True, dtype=torch.float32):
         """
         Fits the model with data `X` and then transforms it.
 
@@ -245,9 +308,10 @@ class IncrementalPCAonGPU():
         Args:
             X (torch.Tensor): The input data tensor with shape (n_samples, n_features).
             check_input (bool, optional): If True, validates the input. Defaults to True.
+            dtype (torch.dtype): if check_input, X, and X_weights will be cast to this dtype. If dtype is complex, X_weights will be cast to the corresponding real dtype.
 
         Returns:
             torch.Tensor: Transformed data tensor with shape (n_samples, n_components).
         """
-        self.fit(X, check_input=check_input)
+        self.fit(X, X_weights, check_input=check_input, dtype=dtype)
         return self.transform(X)
