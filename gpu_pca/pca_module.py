@@ -121,14 +121,24 @@ class IncrementalPCAonGPU():
             eps = torch.tensor(torch.finfo(X.dtype).eps, device=X.device)
 
             new_sample_count = torch.sum(X_weights)
-            new_mean = torch.sum(X_weights[...,None] * X, dim=0) / torch.max(new_sample_count, eps)
-            new_sum_square = torch.sum(X_weights[...,None] * ((X - new_mean) ** 2), dim=0) / torch.maximum(new_sample_count, eps)
-        
+            safe_count = torch.maximum(new_sample_count, eps)
+            new_mean = torch.sum(X_weights[...,None] * X, dim=0) / safe_count
+            # Total weighted sum of squares about the batch mean. Kept unnormalized
+            # (not divided by the sample count), consistent with the unweighted branch.
+            new_sum_square = torch.sum(X_weights[...,None] * ((X - new_mean) ** 2), dim=0)
+
         updated_sample_count = last_sample_count + new_sample_count
-        
+
         updated_mean = (last_sample_count * last_mean + new_sample_count * new_mean) / updated_sample_count
-        updated_variance = (last_variance * (last_sample_count + new_sample_count * last_mean ** 2) + new_sum_square + new_sample_count * new_mean ** 2) / updated_sample_count - updated_mean ** 2
-        
+        # Parallel (Chan et al.) update of the weighted sum of squares:
+        # S_total = S_prev + S_batch + n_prev * n_batch / n_total * (mu_prev - mu_batch)^2
+        delta = last_mean - new_mean
+        updated_variance = (
+            last_variance * last_sample_count
+            + new_sum_square
+            + (last_sample_count * new_sample_count / updated_sample_count) * delta ** 2
+        ) / updated_sample_count
+
         return updated_mean, updated_variance, updated_sample_count
 
     @staticmethod
@@ -229,6 +239,10 @@ class IncrementalPCAonGPU():
         # Whitening
         if self.n_samples_seen_ < eps:
             X -= col_mean
+            if X_weights is not None :
+                # Weighted PCA of the first batch: scale rows by sqrt(w) so that the
+                # SVD below maximizes the weighted covariance, not the unweighted one.
+                X = X * torch.sqrt(X_weights)[...,None]
         else:
 
             if X_weights is None :
@@ -240,7 +254,9 @@ class IncrementalPCAonGPU():
 
             else :
                 col_batch_mean = torch.sum(X_weights[...,None] * X, dim=0) / max(n_samples, eps)
-                X = (X - col_batch_mean) * X_weights[...,None]
+                # Scale rows by sqrt(w): the stacked-matrix trick requires Q^T Q to equal
+                # the weighted sum of squares about the batch mean.
+                X = (X - col_batch_mean) * torch.sqrt(X_weights)[...,None]
                 mean_correction_factor = torch.sqrt(
                     torch.tensor((self.n_samples_seen_ / n_total_samples) * n_samples, device=X.device)
                 )
@@ -270,7 +286,7 @@ class IncrementalPCAonGPU():
         self.var_ = col_var
         self.explained_variance_ = explained_variance[: self.n_components_]
         self.explained_variance_ratio_ = explained_variance_ratio[: self.n_components_]
-        if self.n_components_ != n_features and (abs(self.n_components - n_samples) > eps):
+        if self.n_components_ != n_features and (abs(self.n_components_ - n_samples) > eps):
             self.noise_variance_ = explained_variance[self.n_components_ :].mean().item()
         else:
             self.noise_variance_ = 0.0
@@ -298,7 +314,7 @@ class IncrementalPCAonGPU():
         X -= self.mean_
         return torch.mm(X, self.components_.T)
     
-    def fit_transform(self, X, X_weights, check_input=True, dtype=torch.float32):
+    def fit_transform(self, X, X_weights=None, check_input=True, dtype=torch.float32):
         """
         Fits the model with data `X` and then transforms it.
 
@@ -307,6 +323,7 @@ class IncrementalPCAonGPU():
 
         Args:
             X (torch.Tensor): The input data tensor with shape (n_samples, n_features).
+            X_weights (torch.Tensor): Weights broadcastable to X, with shape (n_samples).
             check_input (bool, optional): If True, validates the input. Defaults to True.
             dtype (torch.dtype): if check_input, X, and X_weights will be cast to this dtype. If dtype is complex, X_weights will be cast to the corresponding real dtype.
 
@@ -314,4 +331,6 @@ class IncrementalPCAonGPU():
             torch.Tensor: Transformed data tensor with shape (n_samples, n_components).
         """
         self.fit(X, X_weights, check_input=check_input, dtype=dtype)
-        return self.transform(X)
+        # Re-validate with the same dtype so that non-float32 fits (e.g. float64)
+        # are not silently downcast by transform's default dtype.
+        return self.transform(X, check_input=True, dtype=dtype)
