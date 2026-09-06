@@ -61,32 +61,32 @@ class IncrementalPCAonGPU():
             torch.Tensor: Validated and possibly copied tensor residing on the specified device.
         """
         if not isinstance(X, torch.Tensor):
-            X = torch.tensor(X, dtype=dtype).to(self.device)
-        if X.device == torch.device("cpu"):
-            X = X.to(self.device)
-        if copy:
-            X = X.clone()
+            X = torch.tensor(X)
+        # Cast to the requested dtype even when X is already a tensor, then move
+        # it to the target device. `copy` controls whether a fresh tensor is returned.
+        X = X.to(device=self.device, dtype=dtype, copy=copy)
 
         if X_weights is not None :
-            # Make sure the weights are reals, even if X is complex
+            # Make sure the weights are reals, even if X (or dtype) is complex
             dtype_real = {
                     torch.complex32:torch.float16,
                     torch.complex64:torch.float32,
                     torch.complex128:torch.float64
-                }.get(X.dtype, X.dtype)
+                }.get(dtype, dtype)
 
             if not isinstance(X_weights, torch.Tensor):
-                X_weights = torch.tensor(X_weights, dtype=dtype_real).to(self.device)
+                X_weights = torch.tensor(X_weights)
+
+            # Weights are applied per sample (row), so flatten them: a column-shaped
+            # (n_samples, 1) input must broadcast like a flat (n_samples,) vector.
+            X_weights = X_weights.reshape(-1)
 
             # Check that X_weights is broadcastable with X up to its feature (last) dim
-            if X.shape[0] != 1 and X_weights.shape[0] != 1 and X.shape[0] != X_weights.shape[0] :
+            if X.shape[0] != 1 and X_weights.numel() not in (1, X.shape[0]):
                 raise ValueError(f"X_weights is not broadcastable to X. {X.shape}, {X_weights.shape}")
-                
-            if X_weights.device == torch.device("cpu"):
-                X_weights = X_weights.to(self.device)
-            if copy:
-                X_weights = X_weights.clone()
-            
+
+            X_weights = X_weights.to(device=self.device, dtype=dtype_real, copy=copy)
+
         return X, X_weights
 
     @staticmethod
@@ -226,6 +226,13 @@ class IncrementalPCAonGPU():
             self.components_ = None
         if self.n_components is None:
             self.n_components_ = min(X.shape[0], n_features)
+        elif not self.n_components <= n_features:
+            raise ValueError(
+                f"n_components={self.n_components} invalid for n_features={n_features}, "
+                "need more rows than columns for IncrementalPCA processing."
+            )
+        else:
+            self.n_components_ = self.n_components
 
         col_mean, col_var, n_total_samples_tensor = self._incremental_mean_and_var(
             X, X_weights, self.mean_, self.var_, torch.tensor([self.n_samples_seen_], device=X.device)
@@ -286,7 +293,10 @@ class IncrementalPCAonGPU():
         self.var_ = col_var
         self.explained_variance_ = explained_variance[: self.n_components_]
         self.explained_variance_ratio_ = explained_variance_ratio[: self.n_components_]
-        if self.n_components_ != n_features and (abs(self.n_components_ - n_samples) > eps):
+        # Set to 0 when every component is retained (nothing left over). Comparing the
+        # kept count against the number of computed singular values also handles weighted
+        # mode, where n_samples is a fractional effective weight count.
+        if self.n_components_ < explained_variance.numel():
             self.noise_variance_ = explained_variance[self.n_components_ :].mean().item()
         else:
             self.noise_variance_ = 0.0

@@ -1,8 +1,12 @@
 import numpy as np
+import pytest
 import torch
 from sklearn.decomposition import IncrementalPCA as SklearnIPCA
 
 from gpu_pca.pca_module import IncrementalPCAonGPU
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def generate_data(n_samples=50000, n_features=100, random_state=None):
@@ -14,8 +18,8 @@ def generate_data(n_samples=50000, n_features=100, random_state=None):
 data1 = generate_data()
 data2 = generate_data()
 
-data1gpu = torch.tensor(data1, device="cuda")
-data2gpu = torch.tensor(data2, device="cuda")
+data1gpu = torch.tensor(data1, device=DEVICE)
+data2gpu = torch.tensor(data2, device=DEVICE)
 
 
 def _as_float64_tensor(A):
@@ -221,9 +225,128 @@ def test_noise_variance_wide_data():
     assert model_k.noise_variance_ > 0.0
 
 
+def _to_f64(A):
+    """Return A as a float64 tensor on the active device."""
+    return torch.tensor(np.asarray(A), dtype=torch.float64, device=DEVICE)
+
+
+def test_weighted_multi_batch_partial_fit_matches_closed_form():
+    """Weighted partial_fit across >=3 batches must match closed-form weighted PCA.
+
+    Feeding one dataset in chunks with matching weight slices exercises the merge
+    path more than twice and must reproduce a single weighted PCA of all samples.
+    """
+    rng = np.random.default_rng(0)
+    X = _to_f64(data1[:4000])
+    w = torch.tensor(rng.random(X.shape[0]) ** 2, dtype=torch.float64, device=DEVICE)
+
+    model = IncrementalPCAonGPU(n_components=5)
+    n_chunks = 7
+    for Xc, wc in zip(torch.chunk(X, n_chunks), torch.chunk(w, n_chunks)):
+        model.partial_fit(Xc, wc)
+
+    ref = _weighted_pca_components(X.cpu().numpy(), w.cpu().numpy(), k=5)
+    assert_subspaces_close(model.components_.cpu().numpy(), ref, atol=1e-2)
+
+
+def test_uniform_weights_match_unweighted():
+    """Uniform weights must reproduce the unweighted result exactly.
+
+    With every weight equal to a constant c, normalization cancels and weighted
+    PCA reduces to ordinary PCA; this catches any residual sqrt/normalization slip.
+    """
+    X = _to_f64(data1[:2000])
+    w = torch.full((X.shape[0],), 3.7, dtype=torch.float64, device=DEVICE)
+
+    model_unweighted = IncrementalPCAonGPU(n_components=5).fit(X)
+    model_weighted = IncrementalPCAonGPU(n_components=5).fit(X, w)
+
+    assert_subspaces_close(
+        model_unweighted.components_.cpu().numpy(),
+        model_weighted.components_.cpu().numpy(),
+        atol=1e-3,
+    )
+
+
+def test_batch_size_invariance_weighted():
+    """Same weights in one batch vs many batches must give the same components."""
+    rng = np.random.default_rng(1)
+    X = _to_f64(data1[:4000])
+    w = torch.tensor(rng.random(X.shape[0]), dtype=torch.float64, device=DEVICE)
+
+    model_single = IncrementalPCAonGPU(n_components=5).fit(X, w)
+
+    model_chunked = IncrementalPCAonGPU(n_components=5, batch_size=250)
+    model_chunked.fit(X, w)
+
+    assert_subspaces_close(
+        model_single.components_.cpu().numpy(),
+        model_chunked.components_.cpu().numpy(),
+        atol=1e-3,
+    )
+
+
+def test_weighted_mean_and_var_attributes():
+    """The estimator's mean_/var_ must match closed-form weighted statistics."""
+    rng = np.random.default_rng(2)
+    X = data1[:500]
+    w = rng.random(X.shape[0]) ** 2
+
+    model = IncrementalPCAonGPU(n_components=3, batch_size=97)
+    model.fit(X, torch.tensor(w, dtype=torch.float64, device=DEVICE), dtype=torch.float64)
+
+    mu = np.average(X, axis=0, weights=w)
+    var = np.average((X - mu) ** 2, axis=0, weights=w)
+    assert np.allclose(model.mean_.cpu().numpy(), mu, atol=1e-5)
+    assert np.allclose(model.var_.cpu().numpy(), var, atol=1e-4)
+
+
+def test_tensor_input_dtype_preserved():
+    """Regression: a tensor input must be cast to the requested dtype.
+
+    Pre-fix, _validate_data only applied `dtype` to numpy inputs; an existing
+    float32 tensor stayed float32 even when dtype=torch.float64 was requested.
+    """
+    X = torch.tensor(data1[:500], dtype=torch.float32, device=DEVICE)
+    model = IncrementalPCAonGPU(n_components=5)
+    out = model.fit_transform(X, dtype=torch.float64)
+    assert out.dtype == torch.float64
+
+
+def test_weight_column_shape_and_length_validation():
+    """Column-shaped weights must broadcast; mismatched lengths must raise."""
+    X = _to_f64(data1[:200])
+    w_row = torch.rand(X.shape[0], dtype=torch.float64, device=DEVICE)
+
+    # A (n, 1) column vector should behave identically to a flat (n,) vector.
+    model_flat = IncrementalPCAonGPU(n_components=3).fit(X, w_row)
+    model_col = IncrementalPCAonGPU(n_components=3).fit(X, w_row.reshape(-1, 1))
+    assert_subspaces_close(
+        model_flat.components_.cpu().numpy(),
+        model_col.components_.cpu().numpy(),
+        atol=1e-6,
+    )
+
+    with pytest.raises(ValueError):
+        IncrementalPCAonGPU(n_components=3).fit(X, torch.rand(X.shape[0] + 7, device=DEVICE))
+
+
 if __name__ == "__main__":
     test_fit_method()
     test_partial_fit_method()
+    test_incremental_mean_and_var_unweighted()
+    test_incremental_mean_and_var_weighted()
+    test_weighted_first_pass_matches_weighted_pca()
+    test_weighted_partial_fit_method()
+    test_weighted_fit_matches_closed_form()
+    test_fit_transform_weights_default_and_dtype()
+    test_noise_variance_wide_data()
+    test_weighted_multi_batch_partial_fit_matches_closed_form()
+    test_uniform_weights_match_unweighted()
+    test_batch_size_invariance_weighted()
+    test_weighted_mean_and_var_attributes()
+    test_tensor_input_dtype_preserved()
+    test_weight_column_shape_and_length_validation()
     test_incremental_mean_and_var_unweighted()
     test_incremental_mean_and_var_weighted()
     test_weighted_first_pass_matches_weighted_pca()
