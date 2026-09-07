@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import math
 from numbers import Integral, Real
-from typing import Optional
 
 import torch
 
@@ -32,27 +31,23 @@ class IncrementalPCAonGPU:
 
     def __init__(
         self,
-        n_components: Optional[int] = None,
+        n_components: int | None = None,
         *,
         whiten: bool = False,
         device=None,
         copy: bool = True,
-        batch_size: Optional[int] = None,
-        svd_driver: Optional[str] = None,
+        batch_size: int | None = None,
+        svd_driver: str | None = None,
         lowrank: bool = False,
-        lowrank_q: Optional[int] = None,
+        lowrank_q: int | None = None,
         lowrank_niter: int = 4,
-        lowrank_seed: Optional[int] = None,
+        lowrank_seed: int | None = None,
         gram: bool = False,
-        # New knobs
-        stats_dtype: Optional[torch.dtype] = None,
+        stats_dtype: torch.dtype | None = None,
         ensure_contiguous: bool = True,
         gram_eps: float = 1e-7,
-        # Perf knobs
-        allow_tf32: Optional[bool] = None,
-        matmul_precision: Optional[
-            str
-        ] = None,  # "highest" | "high" | "medium" (torch>=2.0)
+        allow_tf32: bool | None = None,
+        matmul_precision: str | None = None,
         deterministic_flip: bool = True,
     ):
         self.whiten = whiten
@@ -106,29 +101,21 @@ class IncrementalPCAonGPU:
 
         # Workspace for the augmented matrix; it must not survive a refit on a
         # different shape, device, or dtype.
-        self._x_aug_work: Optional[torch.Tensor] = None
-
-    @staticmethod
-    def _is_positive_integer(value) -> bool:
-        return isinstance(value, Integral) and not isinstance(value, bool) and value > 0
+        self._x_aug_work: torch.Tensor | None = None
 
     def _validate_parameters(self):
+        for name in ("n_components", "batch_size", "lowrank_q"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, Integral) or isinstance(value, bool) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer or None.")
         if self.svd_driver not in (None, "gesvd", "gesvdj", "gesvda"):
             raise ValueError("Invalid svd_driver.")
         if self.svd_driver is not None and self.device.type != "cuda":
             raise ValueError("svd_driver requires a CUDA device.")
         if self.matmul_precision not in (None, "highest", "high", "medium"):
             raise ValueError("Invalid matmul_precision.")
-        if self.n_components is not None and not self._is_positive_integer(
-            self.n_components
-        ):
-            raise ValueError("n_components must be a positive integer or None.")
-        if self.batch_size is not None and not self._is_positive_integer(
-            self.batch_size
-        ):
-            raise ValueError("batch_size must be a positive integer or None.")
-        if self.lowrank_q is not None and not self._is_positive_integer(self.lowrank_q):
-            raise ValueError("lowrank_q must be a positive integer or None.")
         if (
             not isinstance(self.lowrank_niter, Integral)
             or isinstance(self.lowrank_niter, bool)
@@ -159,114 +146,80 @@ class IncrementalPCAonGPU:
 
     @contextlib.contextmanager
     def _matmul_context(self):
-        # Scoped TF32 / matmul precision toggles; restored afterwards.
-        old_tf32 = None
-        old_cudnn_tf32 = None
-        old_prec = None
-        changed_tf32 = self.allow_tf32 is not None and torch.cuda.is_available()
-        changed_prec = self.matmul_precision is not None and hasattr(
-            torch, "set_float32_matmul_precision"
-        )
-
+        """Temporarily apply the requested matrix multiplication precision."""
+        if self.matmul_precision is None and self.allow_tf32 is None:
+            yield
+            return
+        precision = torch.get_float32_matmul_precision()
+        tf32 = torch.backends.cuda.matmul.allow_tf32
         try:
-            if changed_tf32:
-                old_tf32 = torch.backends.cuda.matmul.allow_tf32
-                torch.backends.cuda.matmul.allow_tf32 = bool(self.allow_tf32)
-                # cudnn TF32 can matter for some ops; harmless to mirror
-                if hasattr(torch.backends, "cudnn") and hasattr(
-                    torch.backends.cudnn, "allow_tf32"
-                ):
-                    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
-                    torch.backends.cudnn.allow_tf32 = bool(self.allow_tf32)
-
-            if changed_prec:
-                # torch.get_float32_matmul_precision exists on modern PyTorch
-                if hasattr(torch, "get_float32_matmul_precision"):
-                    old_prec = torch.get_float32_matmul_precision()
+            if self.allow_tf32 is not None:
+                torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
+            if self.matmul_precision is not None:
                 torch.set_float32_matmul_precision(self.matmul_precision)
-
             yield
         finally:
-            if (
-                changed_prec
-                and old_prec is not None
-                and hasattr(torch, "set_float32_matmul_precision")
-            ):
-                torch.set_float32_matmul_precision(old_prec)
-            if changed_tf32 and old_tf32 is not None:
-                torch.backends.cuda.matmul.allow_tf32 = old_tf32
-            if (
-                changed_tf32
-                and old_cudnn_tf32 is not None
-                and hasattr(torch.backends, "cudnn")
-            ):
-                torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.set_float32_matmul_precision(precision)
+            torch.backends.cuda.matmul.allow_tf32 = tf32
 
     def _svd_fn_full(self, X):
-        return torch.linalg.svd(X, full_matrices=False, driver=self.svd_driver)
+        _, S, Vh = torch.linalg.svd(X, full_matrices=False, driver=self.svd_driver)
+        return S, Vh
 
-    def _svd_fn_lowrank(self, X):
-        q = self.lowrank_q
-        if q is None:
-            q = self.n_components_ * 2
-        q = min(q, min(X.shape))
+    def _svd_lowrank(self, X):
+        q = min(self.lowrank_q or 2 * self.n_components_, min(X.shape))
         if q < self.n_components_:
             raise ValueError("lowrank_q must be >= n_components_.")
-
-        seed_enabled = self.lowrank_seed is not None
-        with torch.random.fork_rng(enabled=seed_enabled):
-            if seed_enabled:
+        with torch.random.fork_rng(enabled=self.lowrank_seed is not None):
+            if self.lowrank_seed is not None:
                 torch.manual_seed(self.lowrank_seed)
-            U, S, V = torch.svd_lowrank(X, q=q, niter=self.lowrank_niter)
-            return U, S, V.mH
+            _, S, V = torch.svd_lowrank(X, q=q, niter=self.lowrank_niter)
+        return S, V.mH
 
-    def _svd_fn_gram_topk(self, X):
-        """
-        Wide-matrix fast path: G = X @ X.T then eigh(G), recover Vt.
-        Avoids flipping full eigensystem; slices only top-k.
-        Also fuses invS scaling into the small (k x m) factor before GEMM.
-        """
-        m, D = X.shape
-        if m > D:
-            U, S, Vt = self._svd_fn_full(X)
-            return U, S, Vt, None, None
-
-        k = min(self.n_components_, m)
-
-        # G is (m, m)
-        G = X @ X.mH
-        max_abs_diagonal = G.diagonal().real.abs().max()
-        loading = torch.maximum(
-            max_abs_diagonal.new_tensor(float(self.gram_eps) ** 2),
-            torch.finfo(G.dtype).eps * max(1, m) * max_abs_diagonal,
-        )
-        G.diagonal().add_(loading)
-
+    def _svd_gram(self, X):
+        """Return leading singular pairs, or None when full SVD is safer."""
+        rows, features = X.shape
+        if rows > features:
+            return None
+        gram = X @ X.mH
+        loading = torch.finfo(X.dtype).eps * rows * gram.diagonal().real.abs().max()
+        gram.diagonal().add_(loading.clamp_min(self.gram_eps**2))
         try:
-            _evals, evecs = torch.linalg.eigh(G)  # ascending
+            _, vectors = torch.linalg.eigh(gram)
         except torch.linalg.LinAlgError:
-            U, S, Vt = self._svd_fn_full(X)
-            return U, S, Vt, None, None
+            return None
+        # Recover values from the original matrix, excluding diagonal loading.
+        projected = vectors[:, -self.n_components_ :].flip(1).mH @ X
+        S = torch.linalg.vector_norm(projected, dim=1)
+        if not torch.isfinite(S).all() or (S <= self.gram_eps).any():
+            return None
+        return S, projected / S[:, None]
 
-        # Take largest-k (from the end) then flip just those to descending
-        U_k = evecs[:, -k:].flip(1)  # (m, k)
-
-        # The diagonal loading is only for the eigensolver. Recover the actual,
-        # unshifted spectrum and right singular vectors from the original X.
-        Y = U_k.mH @ X
-        S_k = torch.linalg.vector_norm(Y, dim=1)
-        if (not bool(torch.isfinite(S_k).all())) or bool((S_k <= self.gram_eps).any()):
-            U, S, Vt = self._svd_fn_full(X)
-            return U, S, Vt, None, None
-        Vt_k = Y / S_k[:, None]
-
-        tail_count = m - k
-        if tail_count > 0:
-            tail_ss = (X.abs().square().sum() - S_k.square().sum()).clamp(min=0)
-        else:
-            tail_ss = torch.zeros((), device=X.device, dtype=X.dtype)
-
-        return U_k, S_k, Vt_k, tail_ss, tail_count
+    def _decompose(self, X):
+        """Return retained singular values, component rows, and discarded energy."""
+        approximate = False
+        with self._matmul_context():
+            if self.lowrank:
+                result = self._svd_lowrank(X)
+                approximate = True
+            elif self.gram:
+                result = self._svd_gram(X)
+                approximate = result is not None
+            else:
+                result = None
+            S, Vh = self._svd_fn_full(X) if result is None else result
+        k = self.n_components_
+        residual = (
+            (X.abs().square().sum() - S[:k].square().sum()).clamp_min(0)
+            if approximate
+            else S[k:].square().sum()
+        )
+        S, Vh = S[:k].clone(), Vh[:k].clone()
+        if self.deterministic_flip:
+            pivots = Vh.gather(1, Vh.abs().argmax(dim=1, keepdim=True))
+            # Fix complex phase as well as real sign; left vectors are unused.
+            Vh *= torch.sgn(pivots).conj()
+        return S, Vh, residual
 
     @staticmethod
     def _input_tensor(X):
@@ -277,21 +230,13 @@ class IncrementalPCAonGPU:
 
     def _prepare(self, X, dtype=None, check_input=True):
         X = self._input_tensor(X)
+        valid_dtypes = (torch.float32, torch.float64, torch.complex64, torch.complex128)
         if dtype is None:
-            dtype = (
-                self.components_.dtype
-                if hasattr(self, "components_")
-                else X.dtype
-                if X.dtype
-                in (torch.float32, torch.float64, torch.complex64, torch.complex128)
-                else torch.float32
-            )
-        if dtype not in (
-            torch.float32,
-            torch.float64,
-            torch.complex64,
-            torch.complex128,
-        ):
+            if hasattr(self, "components_"):
+                dtype = self.components_.dtype
+            else:
+                dtype = X.dtype if X.dtype in valid_dtypes else torch.float32
+        if dtype not in valid_dtypes:
             raise ValueError(
                 "dtype must be float32, float64, complex64, or complex128."
             )
@@ -327,26 +272,40 @@ class IncrementalPCAonGPU:
             raise ValueError("Weights must be finite and nonnegative.")
         return w
 
-    @staticmethod
-    def _svd_flip(u, v, u_based_decision=False):
-        # For complex data rotate phases while preserving U @ diag(S) @ Vh.
-        rows = torch.arange(v.shape[0], device=v.device)
-        pivots = v[rows, v.abs().argmax(dim=1)]
-        phase = torch.sgn(pivots)
-        phase = torch.where(phase.abs() == 0, torch.ones_like(phase), phase)
-        return u * phase, v * phase.conj()[:, None]
+    def _augmented_matrix(self, X, weights, batch_mean, mass):
+        """Combine retained scatter, the centered batch, and the mean correction."""
+        center = batch_mean.to(X.dtype)
+        scale = weights.sqrt().to(X.real.dtype)[:, None]
+        if not hasattr(self, "components_"):
+            centered = X - center if self.copy else X.sub_(center)
+            return centered * scale
 
-    def _get_x_aug_work(self, rows, features, device, dtype):
+        k = self.n_components_
+        rows, features = X.shape
+        size = k + rows + 1
         work = self._x_aug_work
-        if (
-            work is None
-            or work.shape[0] < rows
-            or work.shape[1] != features
-            or work.device != device
-            or work.dtype != dtype
-        ):
-            self._x_aug_work = torch.empty((rows, features), device=device, dtype=dtype)
-        return self._x_aug_work[:rows]
+        if work is None or work.shape[0] < size:
+            # Feature count and dtype are fixed during partial_fit; fit clears this.
+            self._x_aug_work = X.new_empty(size, features)
+        matrix = self._x_aug_work[:size]
+        torch.mul(self.components_, self.singular_values_[:, None], out=matrix[:k])
+        torch.sub(X, center, out=matrix[k:-1])
+        matrix[k:-1].mul_(scale)
+        correction = math.sqrt(self.weight_sum_ * mass / (self.weight_sum_ + mass))
+        matrix[-1].copy_((self.mean_ - batch_mean) * correction)
+        return matrix
+
+    def _merge_statistics(self, mean, scatter, mass):
+        """Merge population scatter using the difference between batch means."""
+        if not hasattr(self, "components_"):
+            return mean, scatter
+        previous_mean = self.mean_.to(mean.dtype)
+        previous_scatter = self.var_.to(scatter.dtype) * self.weight_sum_
+        total = self.weight_sum_ + mass
+        delta = mean - previous_mean
+        mean = previous_mean + delta * (mass / total)
+        correction = delta.abs().square() * (self.weight_sum_ * mass / total)
+        return mean, previous_scatter + scatter + correction
 
     @torch.inference_mode()
     def fit(self, X, check_input=True, *, X_weights=None, dtype=None):
@@ -423,68 +382,33 @@ class IncrementalPCAonGPU:
         old_mass = 0 if first else self.weight_sum_
         total = old_mass + mass
         total_square = square_mass + (0 if first else self.weight_square_sum_)
-        if first:
-            mean, ss = batch_mean, batch_ss
-        else:
-            delta = batch_mean - self.mean_.to(stat_dtype)
-            mean = self.mean_.to(stat_dtype) + delta * (mass / total)
-            ss = (
-                self.var_.to(real_dtype) * old_mass
-                + batch_ss
-                + delta.abs().square() * (old_mass * mass / total)
-            )
-        center = batch_mean.to(X.dtype)
-        if first:
-            matrix = X - center if self.copy else X.sub_(center)
-            matrix = matrix * w.sqrt().to(X.real.dtype)[:, None]
-        else:
-            matrix = self._get_x_aug_work(k + rows + 1, features, X.device, X.dtype)
-            torch.mul(self.components_, self.singular_values_[:, None], out=matrix[:k])
-            torch.sub(X, center, out=matrix[k : k + rows])
-            matrix[k : k + rows].mul_(w.sqrt().to(X.real.dtype)[:, None])
-            matrix[-1].copy_(
-                (self.mean_ - batch_mean) * math.sqrt(old_mass * mass / total)
-            )
-        # Backends use the effective rank, including when inferred from the first batch.
+        mean, ss = self._merge_statistics(batch_mean, batch_ss, mass)
+        matrix = self._augmented_matrix(X, w, batch_mean, mass)
         self.n_components_ = k
-        tail_ss = tail_count = None
-        with self._matmul_context():
-            if self.gram:
-                U, S, Vh, tail_ss, tail_count = self._svd_fn_gram_topk(matrix)
-            elif self.lowrank:
-                U, S, Vh = self._svd_fn_lowrank(matrix)
-            else:
-                U, S, Vh = self._svd_fn_full(matrix)
-        if self.deterministic_flip:
-            U, Vh = self._svd_flip(U, Vh)
+        S, components, residual = self._decompose(matrix)
         # Reliability-weighted unbiased covariance; equals n - 1 for unit weights.
         dof = max(0.0, total - total_square / total)
         S2 = S.square()
         variance = S2 / dof if dof > 0 else torch.zeros_like(S2)
         energy = ss.sum()
         ratio = S2 / energy if energy > 0 else torch.zeros_like(S2)
-        self.components_ = Vh[:k].clone()
-        self.singular_values_ = S[:k].clone()
+        self.components_ = components
+        self.singular_values_ = S
         self.mean_ = mean
         self.var_ = ss / total
         self.n_features_ = features
         self.n_samples_seen_ = rows + (0 if first else self.n_samples_seen_)
         self.weight_sum_ = total
         self.weight_square_sum_ = total_square
-        self.explained_variance_ = variance[:k]
-        self.explained_variance_ratio_ = ratio[:k]
+        self.explained_variance_ = variance
+        self.explained_variance_ratio_ = ratio
         self.mean_proj_ = self.mean_.to(X.dtype) @ self.components_.mH
         discarded = min(matrix.shape) - k
-        if discarded > 0 and dof > 0:
-            if tail_ss is not None:
-                residual = tail_ss
-            elif self.lowrank:
-                residual = (matrix.abs().square().sum() - S2[:k].sum()).clamp(min=0)
-            else:
-                residual = S2[k:].sum()
-            self.noise_variance_ = residual / (dof * discarded)
-        else:
-            self.noise_variance_ = S.new_zeros(())
+        self.noise_variance_ = (
+            residual / (dof * discarded)
+            if discarded > 0 and dof > 0
+            else S.new_zeros(())
+        )
         return self
 
     @torch.inference_mode()
